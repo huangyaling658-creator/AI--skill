@@ -96,19 +96,20 @@ return eventList as string
     return events
 
 
-def get_yesterday_unfinished(yesterday: datetime.date) -> tuple[bool, list[str]]:
+def get_yesterday_plan(yesterday: datetime.date) -> tuple[bool, str]:
     """
-    从 Apple 备忘录查找昨日计划笔记，提取所有以 ○ 开头的未完成项。
-    笔记标题格式：M.D 今日计划（如 "3.27 今日计划"）
-    返回 (note_found, [未完成任务描述, ...])
+    从 Apple 备忘录查找昨日计划笔记，返回完整内容供 Claude 参考。
+    搜索策略：标题包含昨天日期（如 "3.27"）且包含"计划"关键词。
+    返回 (note_found, 笔记完整文字内容)
     """
-    note_title = f"{yesterday.month}.{yesterday.day} 今日计划"
+    date_str = f"{yesterday.month}.{yesterday.day}"
 
     script = f'''
 tell application "Notes"
     set targetNote to missing value
     repeat with n in notes of default account
-        if name of n contains "{note_title}" then
+        set noteName to name of n
+        if noteName contains "{date_str}" and noteName contains "计划" then
             set targetNote to n
             exit repeat
         end if
@@ -123,19 +124,13 @@ end tell
 
     ok, output = run_applescript(script)
     if not ok or output == "NOT_FOUND" or not output:
-        return False, []
+        return False, ""
 
-    unfinished = []
-    for line in output.splitlines():
-        stripped = line.strip()
-        # 匹配 ○ 开头（未完成项）
-        if stripped.startswith("○"):
-            # 去掉开头的 ○ 和空格，保留任务描述
-            task = stripped[1:].strip()
-            if task:
-                unfinished.append(task)
-
-    return True, unfinished
+    # 去除 HTML 标签，只保留纯文字
+    import re
+    text = re.sub(r"<[^>]+>", " ", output)
+    text = re.sub(r"\s+", "\n", text).strip()
+    return True, text
 
 
 def main():
@@ -151,13 +146,13 @@ def main():
     yesterday = today - datetime.timedelta(days=1)
 
     calendar_events = get_calendar_events(today)
-    note_found, unfinished = get_yesterday_unfinished(yesterday)
+    note_found, yesterday_plan = get_yesterday_plan(yesterday)
 
     result = {
         "today": today.strftime("%Y-%m-%d"),
         "yesterday": yesterday.strftime("%Y-%m-%d"),
         "calendar_events": calendar_events,
-        "unfinished_yesterday": unfinished,
+        "yesterday_plan": yesterday_plan,
         "yesterday_note_found": note_found,
     }
 

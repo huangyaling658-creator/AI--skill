@@ -1,119 +1,106 @@
 #!/usr/bin/env python3
 """
 write-to-notes.py
-将今日计划写入 Apple 备忘录（仅限 macOS），支持原生 Checklist 打勾格式。
+将今日计划写入 Apple 备忘录，保留正确的换行和纵向排列。
+
+解决方案：
+  将备忘录正文写入 UTF-8 临时文件，让 AppleScript 从文件读取，
+  彻底避免命令行模式下 \\n 换行失效的问题。
 
 用法：
     python3 write-to-notes.py "3.28 今日计划" "计划内容..."
     python3 write-to-notes.py "3.28 今日计划" "计划内容..." append
-
-参数：
-    argv[1] - 备忘录标题
-    argv[2] - 备忘录正文（纯文本，含 ○/✅ 标记）
-    argv[3] - (可选) "append" 追加模式，默认新建
-
-格式映射：
-    ○ 任务   → Apple 备忘录原生 Checklist（未完成，可点击打勾）
-    ✅ 任务  → Apple 备忘录原生 Checklist（已完成，带删除线）
-    【想法】 → 加粗段落
-    其他文字 → 普通段落
-    空行     → 段落间距
 """
 
 import sys
+import os
 import subprocess
+import tempfile
 import datetime
-import html as html_lib
 
 
 # ──────────────────────────────────────────
-# 文本 → Apple Notes HTML
+# 工具
 # ──────────────────────────────────────────
 
-def plan_text_to_html(content: str) -> str:
-    """
-    将计划纯文本转换为 Apple Notes 可识别的 HTML。
-    ○ 行 → <ul class="Apple-checklist"> unchecked item
-    ✅ 行 → <ul class="Apple-checklist"> checked item（带删除线）
-    其他  → <p> 段落
-    """
-    lines = content.split("\n")
-    parts = ["<div>"]
-    in_checklist = False
-
-    for line in lines:
-        s = line.strip()
-
-        # 空行
-        if not s:
-            if in_checklist:
-                parts.append("</ul>")
-                in_checklist = False
-            parts.append("<p><br></p>")
-            continue
-
-        # 未完成任务 ○
-        if s.startswith("○"):
-            if not in_checklist:
-                parts.append('<ul class="Apple-checklist">')
-                in_checklist = True
-            task = html_lib.escape(s[1:].strip())
-            parts.append(f"<li>{task}</li>")
-
-        # 已完成任务 ✅
-        elif s.startswith("✅"):
-            if not in_checklist:
-                parts.append('<ul class="Apple-checklist">')
-                in_checklist = True
-            task = html_lib.escape(s[1:].strip())
-            # checked 状态：Apple Notes 用 checked attribute + 删除线表示
-            parts.append(f'<li data-checked="true"><s>{task}</s></li>')
-
-        # 普通文本（碎碎念、想法、日期行等）
-        else:
-            if in_checklist:
-                parts.append("</ul>")
-                in_checklist = False
-            text = html_lib.escape(s)
-            if s.startswith("【想法】") or s.startswith("[想法]"):
-                parts.append(f"<p><b>{text}</b></p>")
-            else:
-                parts.append(f"<p>{text}</p>")
-
-    if in_checklist:
-        parts.append("</ul>")
-
-    parts.append("</div>")
-    return "\n".join(parts)
-
-
-# ──────────────────────────────────────────
-# 写入 Apple 备忘录
-# ──────────────────────────────────────────
-
-def _escape_for_applescript(s: str) -> str:
-    """转义 AppleScript 字符串中的特殊字符。"""
+def _esc(s: str) -> str:
+    """转义 AppleScript 字符串中的特殊字符（仅用于标题等短字符串）。"""
     return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
+def _run_applescript_file(script: str, timeout: int = 20) -> tuple[bool, str]:
+    """将 AppleScript 写入临时文件并运行，支持多行字符串和 Unicode。"""
+    fd, path = tempfile.mkstemp(suffix=".applescript")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(script)
+        result = subprocess.run(
+            ["osascript", path],
+            capture_output=True, text=True, timeout=timeout
+        )
+        return result.returncode == 0, result.stderr.strip()
+    except subprocess.TimeoutExpired:
+        return False, "超时"
+    except FileNotFoundError:
+        return False, "找不到 osascript，请确认在 macOS 上运行"
+    except Exception as e:
+        return False, str(e)
+    finally:
+        if os.path.exists(path):
+            os.unlink(path)
+
+
+def _text_to_notes_html(content: str) -> str:
+    """
+    将纯文本计划转为 Apple Notes 的 HTML 格式。
+    每行 → <div>...</div>，空行 → <div><br></div>
+    这是 Notes 内部识别换行的唯一正确方式。
+    """
+    import html as html_lib
+    lines = content.split("\n")
+    parts = []
+    for line in lines:
+        s = line.strip()
+        if s == "":
+            parts.append("<div><br></div>")
+        elif s.startswith("○"):
+            parts.append(f"<div>{html_lib.escape(s[1:].strip())}</div>")
+        elif s.startswith("✅"):
+            parts.append(f"<div>{html_lib.escape(s[1:].strip())}</div>")
+        else:
+            parts.append(f"<div>{html_lib.escape(line)}</div>")
+    return "\n".join(parts)
+
+
+def _write_body_to_tempfile(content: str) -> str:
+    """将正文 HTML 写入 UTF-8 临时文件，返回文件路径。"""
+    html_content = _text_to_notes_html(content)
+    fd, path = tempfile.mkstemp(suffix=".txt")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(html_content)
+    return path
+
+
+# ──────────────────────────────────────────
+# 写入备忘录
+# ──────────────────────────────────────────
+
 def write_to_notes(title: str, content: str, mode: str = "new") -> bool:
     """
-    将计划写入 Apple 备忘录，任务行自动转为原生 Checklist。
-
-    Args:
-        title:   备忘录标题
-        content: 计划纯文本（含 ○/✅ 标记）
-        mode:    "new" 新建 | "append" 追加
-
-    Returns:
-        True 成功，False 失败
+    将计划写入 Apple 备忘录。
+    正文通过临时文件传递，确保换行和 Unicode 正确显示。
     """
-    html_body = plan_text_to_html(content)
-    safe_title = _escape_for_applescript(title)
-    safe_html  = _escape_for_applescript(html_body)
+    safe_title = _esc(title)
+    body_path = _write_body_to_tempfile(content)
 
-    if mode == "append":
-        script = f'''
+    try:
+        if mode == "append":
+            script = f'''
+set bodyFile to POSIX file "{body_path}"
+set fileRef to open for access bodyFile
+set newContent to read fileRef as «class utf8»
+close access fileRef
+
 tell application "Notes"
     set targetNote to missing value
     repeat with n in notes of default account
@@ -123,41 +110,35 @@ tell application "Notes"
         end if
     end repeat
     if targetNote is missing value then
-        make new note at default account with properties {{name:"{safe_title}", body:"{safe_html}"}}
+        make new note at default account with properties {{name:"{safe_title}", body:newContent}}
     else
-        set body of targetNote to (body of targetNote) & "{safe_html}"
+        set body of targetNote to (body of targetNote) & newContent
     end if
 end tell
 '''
-    else:
-        script = f'''
+        else:
+            script = f'''
+set bodyFile to POSIX file "{body_path}"
+set fileRef to open for access bodyFile
+set noteBody to read fileRef as «class utf8»
+close access fileRef
+
 tell application "Notes"
-    make new note at default account with properties {{name:"{safe_title}", body:"{safe_html}"}}
+    make new note at default account with properties {{name:"{safe_title}", body:noteBody}}
 end tell
 '''
 
-    try:
-        result = subprocess.run(
-            ["osascript", "-e", script],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-        if result.returncode == 0:
-            print(f"✅ 成功写入备忘录：{title}（含可打勾 Checklist）")
-            return True
+        ok, err = _run_applescript_file(script)
+        if ok:
+            task_count = sum(1 for l in content.split("\n") if l.strip().startswith("○"))
+            print(f"✅ 成功写入备忘录：{title}（{task_count} 条任务，纵向排列）")
         else:
-            print(f"❌ AppleScript 错误：{result.stderr.strip()}")
-            return False
-    except subprocess.TimeoutExpired:
-        print("❌ 超时：Apple 备忘录响应太慢")
-        return False
-    except FileNotFoundError:
-        print("❌ 找不到 osascript，请确认你在 macOS 上运行")
-        return False
-    except Exception as e:
-        print(f"❌ 未知错误：{e}")
-        return False
+            print(f"❌ AppleScript 错误：{err}")
+        return ok
+
+    finally:
+        if os.path.exists(body_path):
+            os.unlink(body_path)
 
 
 # ──────────────────────────────────────────
@@ -167,14 +148,12 @@ end tell
 def main():
     if len(sys.argv) < 3:
         print("用法：python3 write-to-notes.py <标题> <内容> [append]")
-        print("示例：python3 write-to-notes.py '3.28 今日计划' '3.28\\n昨晚睡得不错\\n○ 做AI音乐 11-12\\n✅ 吃饭 12-13'")
         sys.exit(1)
 
     title   = sys.argv[1]
     content = sys.argv[2]
     mode    = sys.argv[3] if len(sys.argv) > 3 else "new"
 
-    # 标题没有数字时自动加今日日期
     today = datetime.date.today()
     if not any(ch.isdigit() for ch in title):
         title = f"{today.month}.{today.day} {title}"
